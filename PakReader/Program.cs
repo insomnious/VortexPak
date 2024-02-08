@@ -9,7 +9,10 @@ using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using ICSharpCode.SharpZipLib.Zip.Compression;
+using ICSharpCode.SharpZipLib.Zip.Compression.Streams;
 using Newtonsoft.Json;
+using Oodle.NET;
 
 namespace PakReader;
 
@@ -99,6 +102,14 @@ struct InfoBitfield : IBitField
     public bool IsOffset32BitSafe { get; set; }
 }
 
+public class PakException : Exception
+{
+    public PakException(string message) : base(message)
+    {
+        
+    }
+}
+
 struct Footer
 {
     public long footerOffset;
@@ -112,7 +123,6 @@ struct Footer
     public bool frozenIndex;
     public string[] compressionMethods;
 }
-
 struct Index
 {
     public int mountPointSize;
@@ -122,15 +132,16 @@ struct Index
     public bool hasPathHashIndex;
     public long pathHashIndexOffset;
     public long pathHashIndexSize;
-    public byte[] pathHashIndexHash; // 20 bytes
+    public string pathHashIndexHash; // 20 bytes
     public bool hasFullDirectoryIndex;
     public long fullDirectoryIndexOffset;
     public long fullDirectoryIndexSize;
-    public byte[] fullDirectoryIndexHash;
+    public string fullDirectoryIndexHash;
     public int encodedEntryInfoSize;
+    [JsonIgnore]
     public byte[] encodedEntryInfo; // size is above
     public uint recordCount;
-    public IndexRecord[] records;
+    public IndexRecord[] indexRecords; 
 }
 
 struct IndexRecord
@@ -144,6 +155,7 @@ struct IndexRecord
 struct DataRecord
 {
     public Record fileMetadata;
+    public long dataOffset;
     [JsonIgnore]
     public byte[] fileData;
 }
@@ -156,7 +168,7 @@ struct CompressionBlock
                        version 7: offset is relative to the offset
                                   field in the corresponding Record
  */
-    public ulong startOffset; 
+    public long startOffset; 
 
     /*compressed data block end offset.
                            There may or may not be a gap between blocks.
@@ -164,29 +176,29 @@ struct CompressionBlock
                            version 7: offset is relative to the offset
                                       field in the corresponding Record
                                       */
-    public ulong endOffset;
+    public long endOffset;
 }
     
 struct Record
 {
-    public ulong offset;
-    public ulong size;
-    public ulong uncompressedSize;
+    public long offset; // 8
+    public long size; // 8
+    public long uncompressedSize; // 8
     /*
         0x00 ... none
         0x01 ... zlib
         0x10 ... bias memory
         0x20 ... bias speed
      */
-    public uint compressionMethod;
+    public uint compressionMethod; // 4
     public ulong timestamp; // version 1
-    public string dataHash; //sha1 hash
+    public string dataHash; //sha1 hash // 20 // compressed data hash, not decompressed
     // if compressed
-    public uint blockCount;
-    public CompressionBlock[] compressionBlocks;
+    public uint blockCount; // 4
+    public CompressionBlock[] compressionBlocks; // 16 * blockCount
     
-    public bool isEncrypted;
-    public uint compressionBlockUncompressedSize;
+    public bool isEncrypted; // 1
+    public uint compressionBlockUncompressedSize; // 4
 }
     
 struct FullDirectoryIndex
@@ -208,6 +220,7 @@ struct File
     public int filenameSize;
     public string filename;
     public uint encodedEntryInfoOffset;
+    public EncodedRecord encodedRecord;
     public DataRecord dataRecord;
 }
 
@@ -229,6 +242,7 @@ struct EncodedRecord
 
 struct PakFile
 {
+    public string filename;
     public Footer footer;
     public Index index;
     public FullDirectoryIndex fullDirectoryIndex;
@@ -242,62 +256,95 @@ class Program
     private const int PAK_ENCRYPTION_GUID_SIZE = 16;
     private const int INDEX_HASH_SIZE = 20;
     private const int PAK_BOOL_SIZE = 1;
+    private const long FOOTER_SEARCH_SIZE = 226; // offset from the bottom to start the search for the magic
+    private const int MAX_SUPPORTED_VERSION = 11;
 
     private const int MAGIC = 1517228769;
 
+    
     static async Task<int> Main(string[] args)
     {
+
+        var extractOption = new Option<Boolean>(new[] { "--extract", "-e" }, () => false, "Extract PAK file contents");
+        var fileArgument = new Argument<FileInfo>(name: "file", description: "PAK file to parse");
+        
         var rootCommand = new RootCommand("Sample command-line app")
         {
-            new Argument<FileInfo>(name: "file", description: "PAK file to parse")
+            fileArgument,
+            extractOption
         };
 
-        rootCommand.Handler = CommandHandler.Create<FileInfo>(ReadFile);
+        rootCommand.SetHandler(ReadFile, fileArgument, extractOption);
 
         return await rootCommand.InvokeAsync(args);
     }
 
-    private static void ReadFile(FileInfo file)
+    private static void ReadFile(FileInfo file, bool extractOption)
     {
         try
         {
-            using (var br = new BinaryReader(file.OpenRead()))
+            using var br = new BinaryReader(file.OpenRead());
+            
+            var version = FindFileVersion(br);
+
+            Console.WriteLine($"File version is {version}");
+
+            if (version == 0 || version > MAX_SUPPORTED_VERSION)
             {
-                var version = FindFileVersion(br);
-                
-                Console.WriteLine($"File version is {version}");
-
-                if (version == 0)
-                {
-                    Console.Error.WriteLine("File version couldn't be found");
-                    Environment.Exit(1);
-                }
-
-                var pakFile = ReadPak(br, version);
-                
-                var json = JsonConvert.SerializeObject(pakFile, Formatting.Indented);
-                
-                Console.Write(json);
-
-                // extract files and write meta json?
-                /*
-                File.WriteAllText(Path.ChangeExtension(file.FullName, ".json"), json);
-                
-                for (int i = 0; i< index.records.Length; i++)
-                {
-                    string outfile = Path.GetFullPath(Path.Combine("C:\\", index.records[i].filename));
-                    (new FileInfo(outfile)).Directory.Create();
-                    File.WriteAllBytes(outfile, index.records[i].dataRecord.fileData);
-                }*/
-                
+                throw new PakException($"Version not supported. Not a valid PAK file");
             }
 
+            var pakFile = ReadPak(br, version);
+            pakFile.filename = Path.GetFileName(file.FullName);
+
+            var json = JsonConvert.SerializeObject(pakFile, Formatting.Indented);
+
+            Console.WriteLine(json);
+
+            // extract files and write meta json?
+
+            System.IO.File.WriteAllText(Path.ChangeExtension(file.FullName, ".json"), json);
+
+            if (extractOption)
+            {
+                Console.WriteLine("Extract the files");
+                
+                if(pakFile.index.hasFullDirectoryIndex)
+                {
+                    Console.WriteLine("This file contains a full directory index");
+                    
+                    ExtractFromFullDirectory(br, pakFile.index, pakFile.fullDirectoryIndex);
+                }
+                else
+                {
+                    Console.WriteLine("This file contains the legacy index record");
+
+                    ExtractFromIndex(br, pakFile.index);
+                }
+                
+                Console.WriteLine("Extraction complete");
+                
+                // modern records
+            }
+            else
+            {
+                Console.WriteLine("Don't extract the files");
+            }
+
+            
+                
         }
         catch (FileNotFoundException fnfe)
         {
             // Exception handler for FileNotFoundException
             // We just inform the user that there is no such file
             Console.WriteLine("The file '{0}' is not found.", file);
+        }
+        catch (PakException pex)
+        {
+            // Exception handler for PakException
+            // We just inform the user with the message
+            Console.WriteLine(pex.Message);
         }
         catch (IOException ioe)
         {
@@ -311,9 +358,141 @@ class Program
         }
 
     }
-    
-    
 
+    private static void ExtractFromIndex(BinaryReader br, Index index)
+    {
+        foreach (var record in index.indexRecords)
+        {
+            string outfile = Path.GetFullPath(Path.Combine("C:\\", $"{index.mountPoint}{record.filename}"));
+            Console.WriteLine($"Outfile: {outfile}");
+                
+            byte[] bytes = GetBytesFromPak(br, record.dataRecord, $"{index.mountPoint}{record.filename}");
+                    
+            (new FileInfo(outfile)).Directory.Create();
+            System.IO.File.WriteAllBytes(outfile, bytes);
+            
+        }
+    }
+    
+    private static void ExtractFromFullDirectory(BinaryReader br, Index index, FullDirectoryIndex fullDirectoryIndex)
+    {
+        foreach (var dir in fullDirectoryIndex.directories)
+        {
+            foreach (var file in dir.files)
+            {
+                string outfile = Path.GetFullPath(Path.Combine("C:\\", $"{index.mountPoint}{dir.directoryName}{file.filename}"));
+                Console.WriteLine($"Outfile: {outfile}");
+                
+                byte[] bytes = GetBytesFromPak(br, file.dataRecord, $"{index.mountPoint}{dir.directoryName}{file.filename}", true);
+                    
+                (new FileInfo(outfile)).Directory.Create();
+                System.IO.File.WriteAllBytes(outfile, bytes);
+            }
+        }
+
+    }
+
+    private static byte[] GetBytesFromPak(BinaryReader br, DataRecord dataRecord, string path, bool useOodle = false)
+    {
+        if (dataRecord.fileMetadata.compressionMethod == 0)
+        {
+            Console.WriteLine($"{path} is uncompressed");
+
+            long offset = dataRecord.dataOffset;
+            long size = dataRecord.fileMetadata.size;
+
+            br.BaseStream.Seek(offset, SeekOrigin.Begin);
+            return br.ReadBytes((int)size);
+        }
+
+        Console.WriteLine($"{path} is compressed. This has {dataRecord.fileMetadata.blockCount} blocks.");
+        
+        // get complete compressed data
+        
+        var compressed = new byte[dataRecord.fileMetadata.size];
+        var decompressed = new byte[dataRecord.fileMetadata.uncompressedSize];
+
+        using var decompressedStream = new MemoryStream();
+        
+        for (int i = 0; i < dataRecord.fileMetadata.compressionBlocks.Length; i++)
+        {
+            var block = dataRecord.fileMetadata.compressionBlocks[i];
+
+            Console.WriteLine($"  [{i:D3}] start: {block.startOffset} end: {block.endOffset} size: {block.endOffset - block.startOffset}");
+
+            var offset = block.startOffset;
+            var size = block.endOffset - block.startOffset;
+
+            br.BaseStream.Seek(offset, SeekOrigin.Begin);
+
+            byte[] blockData = br.ReadBytes((int)size);
+
+            if (blockData == null) // Handle end of stream
+                break;
+
+            var decompressedBlock = useOodle ? OodleDecompress(blockData, (int) dataRecord.fileMetadata.compressionBlockUncompressedSize) : ZLibDecompress(blockData);
+
+            // Append block data to buffer
+            decompressedStream.Write(decompressedBlock, 0, decompressedBlock.Length);
+        }
+            
+        //decompressed = Decompress(ms);
+        decompressed = decompressedStream.ToArray();
+
+        //System.IO.File.WriteAllBytes(@"C:\Pal\dump.bin", compressed);
+
+        //decompressed = ChunkedDecompress(compressed);
+
+        return decompressed;
+    }
+    
+    private static unsafe byte[] OodleDecompress(byte[] compressedBuffer, int decompressedSize)
+    {
+        using var oodle = new OodleCompressor(Path.Join(Path.GetDirectoryName(Assembly.GetEntryAssembly().Location), "oo2core_9_win64.dll"));
+        //var compressedBuffer = System.IO.File.ReadAllBytes(@"C:\Test\Example.bin");
+        var decompressedBuffer = new byte[decompressedSize];
+        var result = oodle.DecompressBuffer(compressedBuffer, compressedBuffer.Length, decompressedBuffer,
+            decompressedSize, OodleLZ_FuzzSafe.No, OodleLZ_CheckCRC.No, OodleLZ_Verbosity.None, 0L, 0L, 0L, 0L, 0L, 0L,
+            OodleLZ_Decode_ThreadPhase.Unthreaded);
+        return decompressedBuffer;
+    }
+    
+    public static byte[] ZLibDecompress(byte[] zLibCompressedBuffer)
+    {
+        byte[] resBuffer = null;
+
+        MemoryStream mInStream = new MemoryStream(zLibCompressedBuffer);
+        MemoryStream mOutStream = new MemoryStream(zLibCompressedBuffer.Length);
+        InflaterInputStream infStream = new InflaterInputStream(mInStream);
+
+        mInStream.Position = 0;
+
+        try
+        {
+            byte[] tmpBuffer = new byte[zLibCompressedBuffer.Length];
+            int read = 0;
+
+            do
+            {
+                read = infStream.Read(tmpBuffer, 0, tmpBuffer.Length);
+                if (read > 0)
+                    mOutStream.Write(tmpBuffer, 0, read);
+
+            } while (read > 0);
+
+            resBuffer = mOutStream.ToArray();
+        }
+        finally
+        {
+            infStream.Close();
+            mInStream.Close();
+            mOutStream.Close();
+        }
+
+        return resBuffer;
+    }
+    
+    
    
     private static PakFile ReadPak(BinaryReader br, int version)
     {
@@ -384,11 +563,11 @@ class Program
                         encodedRecord.blockSize = reader.ReadUInt32();
                     }*/
 
+                    file.encodedRecord = encodedRecord;
+
                     // get data reecord?
 
-                    DataRecord dataRecord = GetDataRecord(br, version, (long)encodedRecord.offset);
-
-                    file.dataRecord = dataRecord;
+                    file.dataRecord = GetDataRecord(br, version, (long)encodedRecord.offset);
                     
                     dir.files[j] = file;
 
@@ -450,8 +629,13 @@ class Program
 
     private static int FindFileVersion(BinaryReader br)
     {
+        if(br.BaseStream.Length < FOOTER_SEARCH_SIZE)
+        {
+            throw new PakException($"File is too small. Not a valid PAK file");
+        }
+        
         // start with the max offset for footer
-        var pos = br.BaseStream.Length - 226;
+        var pos = br.BaseStream.Length - FOOTER_SEARCH_SIZE;
 
         br.BaseStream.Seek(pos, 0);
 
@@ -476,8 +660,8 @@ class Program
             // re-seek
             br.BaseStream.Seek(pos, 0);
         }
-
-        return 0;
+        
+        throw new PakException($"Magic byte not found. Not a valid PAK file");
     }
 
     private static Footer ReadFooter(BinaryReader br, int version)
@@ -556,7 +740,7 @@ class Program
         {
             index.pathHashIndexOffset = br.ReadInt64();
             index.pathHashIndexSize = br.ReadInt64();
-            index.pathHashIndexHash = br.ReadBytes(20);
+            index.pathHashIndexHash = BitConverter.ToString(br.ReadBytes(20)).Replace("-", string.Empty);
         }
 
         index.hasFullDirectoryIndex = Convert.ToBoolean(br.ReadUInt32());
@@ -565,7 +749,7 @@ class Program
         {
             index.fullDirectoryIndexOffset = br.ReadInt64();
             index.fullDirectoryIndexSize = br.ReadInt64();
-            index.fullDirectoryIndexHash = br.ReadBytes(20);
+            index.fullDirectoryIndexHash = BitConverter.ToString(br.ReadBytes(20)).Replace("-", string.Empty);
         }
 
         index.encodedEntryInfoSize = br.ReadInt32();
@@ -588,9 +772,9 @@ class Program
         
         index.recordCount = br.ReadUInt32();
         
-        index.records = new IndexRecord[index.recordCount];
+        index.indexRecords = new IndexRecord[index.recordCount];
 
-        for (int i = 0; i < index.records.Length; i++)
+        for (int i = 0; i < index.indexRecords.Length; i++)
         {
             var indexRecord = new IndexRecord
             {
@@ -602,7 +786,7 @@ class Program
             //DataRecord
             indexRecord.dataRecord = GetDataRecord(br, version, (long)indexRecord.fileMetadata.offset);
 
-            index.records[i] = indexRecord;
+            index.indexRecords[i] = indexRecord;
         }
         
         return index;
@@ -613,12 +797,18 @@ class Program
         // seek to new position
         br.BaseStream.Seek(position, SeekOrigin.Begin);
 
+        /*
+         *  version <= 4: offset is absolute to the file
+            version 7: offset is relative to the offset field in the corresponding Record
+         */
+        var compressionBlockOffset = version >= 7 ? position : 0;
+
         // set up basics for all versions
         var record = new Record()
         {
-            offset = br.ReadUInt64(),
-            size = br.ReadUInt64(),
-            uncompressedSize = br.ReadUInt64(),
+            offset = br.ReadInt64(),
+            size = br.ReadInt64(),
+            uncompressedSize = br.ReadInt64(),
             compressionMethod = br.ReadUInt32()
         };
 
@@ -634,10 +824,13 @@ class Program
                 record.blockCount = br.ReadUInt32();
                 record.compressionBlocks = new CompressionBlock[record.blockCount];
 
+
+                
                 for (int j = 0; j < record.compressionBlocks.Length; j++)
                 {
-                    record.compressionBlocks[j].startOffset = br.ReadUInt64();
-                    record.compressionBlocks[j].endOffset = br.ReadUInt64();
+                    
+                    record.compressionBlocks[j].startOffset = br.ReadInt64() + compressionBlockOffset;
+                    record.compressionBlocks[j].endOffset = br.ReadInt64() + compressionBlockOffset;
                 }
             }
 
@@ -659,12 +852,15 @@ class Program
         // seek to new position
         br.BaseStream.Seek(position, SeekOrigin.Begin);
 
-        var dataRecord = new DataRecord();
+        var dataRecord = new DataRecord
+        {
+            fileMetadata = GetRecord(br, version, position),
+            dataOffset = br.BaseStream.Position
+        };
 
-        dataRecord.fileMetadata = GetRecord(br, version, position);
-        
-        dataRecord.fileData = br.ReadBytes((int)dataRecord.fileMetadata.size);
-        
+        // we don't want to read the actual bytes at this point
+        // we will save the position (above) for later though
+        //dataRecord.fileData = br.ReadBytes((int)dataRecord.fileMetadata.size);
         
         // seek to old position
         br.BaseStream.Seek(oldPosition, SeekOrigin.Begin);
