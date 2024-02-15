@@ -236,7 +236,7 @@ struct EncodedRecord
     public InfoBitfield info; // bitfield
     public ulong offset;
     public ulong uncompressedSize;
-    public uint size;
+    public ulong size;
     public uint blockSize;
 }
 
@@ -299,7 +299,7 @@ class Program
 
             var json = JsonConvert.SerializeObject(pakFile, Formatting.Indented);
 
-            Console.WriteLine(json);
+            //Console.WriteLine(json);
 
             // extract files and write meta json?
 
@@ -542,15 +542,19 @@ class Program
 
                     encodedRecord.info = CreateBitField<InfoBitfield>((ulong)intValue);
 
-                    encodedRecord.offset =
-                        encodedRecord.info.IsSize32BitSafe ? reader.ReadUInt32() : reader.ReadUInt64();
+                    encodedRecord.offset = encodedRecord.info.IsOffset32BitSafe 
+                        ? reader.ReadUInt32() 
+                        : reader.ReadUInt64();
+                    
                     encodedRecord.uncompressedSize = encodedRecord.info.IsUncompressedSize32BitSafe
                         ? reader.ReadUInt32()
                         : reader.ReadUInt64();
 
                     if (encodedRecord.info.CompressionMethod != 0)
                     {
-                        encodedRecord.size = reader.ReadUInt32();
+                        encodedRecord.size = encodedRecord.info.IsSize32BitSafe
+                        ? reader.ReadUInt32()
+                        : reader.ReadUInt64();
                     }
                     else
                     {
