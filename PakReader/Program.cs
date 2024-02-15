@@ -281,6 +281,9 @@ class Program
 
     private static void ReadFile(FileInfo file, bool extractOption)
     {
+        Stopwatch sw = new Stopwatch();
+        sw.Start();
+        
         try
         {
             using var br = new BinaryReader(file.OpenRead());
@@ -296,33 +299,48 @@ class Program
 
             var pakFile = ReadPak(br, version);
             pakFile.filename = Path.GetFileName(file.FullName);
+                
+            Console.WriteLine($"Indexing complete in {sw.Elapsed:hh\\:mm\\:ss}");
+
+            var outputFolder = Path.Join("C:\\", Path.GetFileNameWithoutExtension(file.FullName));
 
             var json = JsonConvert.SerializeObject(pakFile, Formatting.Indented);
+            
+            var jsonOutput = Path.ChangeExtension(file.FullName, ".json");
 
             //Console.WriteLine(json);
 
             // extract files and write meta json?
+            
+            Console.WriteLine($"Writing JSON to {jsonOutput}");
 
-            System.IO.File.WriteAllText(Path.ChangeExtension(file.FullName, ".json"), json);
+            System.IO.File.WriteAllText(jsonOutput, json);
+            
 
             if (extractOption)
             {
                 Console.WriteLine("Extract the files");
                 
+                Console.WriteLine($"Extraction output folder is {outputFolder}");
+                
                 if(pakFile.index.hasFullDirectoryIndex)
                 {
                     Console.WriteLine("This file contains a full directory index");
-                    
-                    ExtractFromFullDirectory(br, pakFile.index, pakFile.fullDirectoryIndex);
+
+                    ExtractFromFullDirectory(br, pakFile.index, pakFile.fullDirectoryIndex, outputFolder);
                 }
                 else
                 {
                     Console.WriteLine("This file contains the legacy index record");
 
-                    ExtractFromIndex(br, pakFile.index);
+                    ExtractFromIndex(br, pakFile.index, outputFolder);
                 }
                 
                 Console.WriteLine("Extraction complete");
+                
+                sw.Stop();
+                Console.WriteLine($"Extraction completed in {sw.Elapsed:hh\\:mm\\:ss}");
+                
                 
                 // modern records
             }
@@ -359,66 +377,87 @@ class Program
 
     }
 
-    private static void ExtractFromIndex(BinaryReader br, Index index)
+    private static void ExtractFromIndex(BinaryReader br, Index index, string outputFolder)
     {
         foreach (var record in index.indexRecords)
         {
-            string outfile = Path.GetFullPath(Path.Combine("C:\\", $"{index.mountPoint}{record.filename}"));
+            string outfile = Path.GetFullPath(Path.Combine(outputFolder , $"{index.mountPoint}{record.filename}"));
             Console.WriteLine($"Outfile: {outfile}");
                 
-            byte[] bytes = GetBytesFromPak(br, record.dataRecord, $"{index.mountPoint}{record.filename}");
+            //byte[] bytes = GetBytesFromPak(br, record.dataRecord, $"{index.mountPoint}{record.filename}");
+            GetBytesFromPak(br, record.dataRecord, $"{index.mountPoint}{record.filename}", outfile);
                     
-            (new FileInfo(outfile)).Directory.Create();
-            System.IO.File.WriteAllBytes(outfile, bytes);
+            //(new FileInfo(outfile)).Directory.Create();
+            //System.IO.File.WriteAllBytes(outfile, bytes);
             
         }
     }
     
-    private static void ExtractFromFullDirectory(BinaryReader br, Index index, FullDirectoryIndex fullDirectoryIndex)
+    private static void ExtractFromFullDirectory(BinaryReader br, Index index, FullDirectoryIndex fullDirectoryIndex, string outputFolder)
     {
         foreach (var dir in fullDirectoryIndex.directories)
         {
             foreach (var file in dir.files)
             {
-                string outfile = Path.GetFullPath(Path.Combine("C:\\", $"{index.mountPoint}{dir.directoryName}{file.filename}"));
-                Console.WriteLine($"Outfile: {outfile}");
+                string outfile = Path.GetFullPath(Path.Combine(outputFolder, $"{dir.directoryName}{file.filename}"));
                 
-                byte[] bytes = GetBytesFromPak(br, file.dataRecord, $"{index.mountPoint}{dir.directoryName}{file.filename}", true);
+                Stopwatch sw = new Stopwatch();
+                sw.Start();
+                
+                //byte[] bytes = GetBytesFromPak(br, file.dataRecord, $"{index.mountPoint}{dir.directoryName}{file.filename}", true);
+                GetBytesFromPak(br, file.dataRecord, $"{index.mountPoint}{dir.directoryName}{file.filename}", outfile, true);
                     
-                (new FileInfo(outfile)).Directory.Create();
-                System.IO.File.WriteAllBytes(outfile, bytes);
+                Console.WriteLine($"{outfile} ({file.dataRecord.fileMetadata.uncompressedSize:n0} bytes) written in {sw.Elapsed:ss\\.ffff} seconds");
+                //(new FileInfo(outfile)).Directory.Create();
+                //System.IO.File.WriteAllBytes(outfile, bytes);
             }
         }
 
     }
 
-    private static byte[] GetBytesFromPak(BinaryReader br, DataRecord dataRecord, string path, bool useOodle = false)
+    private static void GetBytesFromPak(BinaryReader br, DataRecord dataRecord, string path, string outfile, bool useOodle = false)
     {
         if (dataRecord.fileMetadata.compressionMethod == 0)
         {
-            Console.WriteLine($"{path} is uncompressed");
+            //Console.WriteLine($"{path} is uncompressed");
 
             long offset = dataRecord.dataOffset;
             long size = dataRecord.fileMetadata.size;
 
             br.BaseStream.Seek(offset, SeekOrigin.Begin);
-            return br.ReadBytes((int)size);
+            
+            if (System.IO.File.Exists(outfile))
+            {
+                System.IO.File.Delete(outfile);
+            }
+            
+            AppendAllBytes(outfile, br.ReadBytes((int)size));
+            
+            //return br.ReadBytes((int)size);
+            return;
         }
 
-        Console.WriteLine($"{path} is compressed. This has {dataRecord.fileMetadata.blockCount} blocks.");
+        //Console.WriteLine($"{path} is compressed. This has {dataRecord.fileMetadata.blockCount} blocks.");
         
         // get complete compressed data
         
         var compressed = new byte[dataRecord.fileMetadata.size];
-        var decompressed = new byte[dataRecord.fileMetadata.uncompressedSize];
+        //var decompressed = new byte[dataRecord.fileMetadata.uncompressedSize];
+        byte[] decompressed;
 
-        using var decompressedStream = new MemoryStream();
+        //using var decompressedStream = new MemoryStream();
+        
+        // remove file if it exists so we can write it in blocks where necessary
+        if (System.IO.File.Exists(outfile))
+        {
+            System.IO.File.Delete(outfile);
+        }
         
         for (int i = 0; i < dataRecord.fileMetadata.compressionBlocks.Length; i++)
         {
             var block = dataRecord.fileMetadata.compressionBlocks[i];
 
-            Console.WriteLine($"  [{i:D3}] start: {block.startOffset} end: {block.endOffset} size: {block.endOffset - block.startOffset}");
+            //Console.WriteLine($"  [{i:D5}] start: {block.startOffset} end: {block.endOffset} size: {block.endOffset - block.startOffset}");
 
             var offset = block.startOffset;
             var size = block.endOffset - block.startOffset;
@@ -431,19 +470,33 @@ class Program
                 break;
 
             var decompressedBlock = useOodle ? OodleDecompress(blockData, (int) dataRecord.fileMetadata.compressionBlockUncompressedSize) : ZLibDecompress(blockData);
+            
 
             // Append block data to buffer
-            decompressedStream.Write(decompressedBlock, 0, decompressedBlock.Length);
+            //decompressedStream.Write(decompressedBlock, 0, decompressedBlock.Length);
+            
+            AppendAllBytes(outfile, decompressedBlock);
+            
         }
             
         //decompressed = Decompress(ms);
-        decompressed = decompressedStream.ToArray();
+        //decompressed = decompressedStream.ToArray();
 
         //System.IO.File.WriteAllBytes(@"C:\Pal\dump.bin", compressed);
 
         //decompressed = ChunkedDecompress(compressed);
 
-        return decompressed;
+        //return decompressed;
+    }
+    
+    private static void AppendAllBytes(string path, byte[] bytes)
+    {
+        (new FileInfo(path)).Directory.Create();
+
+        //argument-checking here.
+
+        using var stream = new FileStream(path, FileMode.Append);
+        stream.Write(bytes, 0, bytes.Length);
     }
     
     private static unsafe byte[] OodleDecompress(byte[] compressedBuffer, int decompressedSize)
