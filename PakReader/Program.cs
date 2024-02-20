@@ -12,6 +12,7 @@ using System.Security.Cryptography;
 using ICSharpCode.SharpZipLib.Zip.Compression;
 using ICSharpCode.SharpZipLib.Zip.Compression.Streams;
 using Newtonsoft.Json;
+using NLog;
 using Oodle.NET;
 
 namespace PakReader;
@@ -140,7 +141,7 @@ struct Index
     public int encodedEntryInfoSize;
     [JsonIgnore]
     public byte[] encodedEntryInfo; // size is above
-    public uint recordCount;
+    public int recordCount;
     public IndexRecord[] indexRecords; 
 }
 
@@ -248,8 +249,20 @@ struct PakFile
     public FullDirectoryIndex fullDirectoryIndex;
 }
 
+struct Summary
+{
+    public string path;
+    public bool encrypted;
+    public int fileVersion;
+    public int fileCount;
+    public string mountPoint;
+    public bool extracted;
+}
+
 class Program
 {
+    private static Logger logger;
+
     private const int PAK_COMPRESSION_METHOD_SIZE = 32;
     private const int PAK_COMPRESSION_METHOD_COUNT = 5;
     private const int PAK_COMPRESSION_METHOD_COUNT_V8 = 4;
@@ -264,25 +277,55 @@ class Program
     
     static async Task<int> Main(string[] args)
     {
-
         var extractOption = new Option<Boolean>(new[] { "--extract", "-e" }, () => false, "Extract PAK file contents");
+        var jsonOption = new Option<Boolean>(new[] { "--json", "-j" }, () => false, "Write JSON metadata file");
+        var debugOption = new Option<Boolean>(new[] { "--debug", "-d" }, () => false, "Debug output");
         var fileArgument = new Argument<FileInfo>(name: "file", description: "PAK file to parse");
         
         var rootCommand = new RootCommand("Sample command-line app")
         {
             fileArgument,
-            extractOption
+            extractOption,
+            jsonOption,
+            debugOption
         };
 
-        rootCommand.SetHandler(ReadFile, fileArgument, extractOption);
+        rootCommand.SetHandler(ReadFile, fileArgument, extractOption, jsonOption, debugOption);
 
+        // logging stuff
+        
+        // create a configuration instance
+        var config = new NLog.Config.LoggingConfiguration();
+
+        // create a console logging target
+        var logConsole = new NLog.Targets.ConsoleTarget();
+
+        var debugConsole = new NLog.Targets.DebugSystemTarget();
+
+        // send logs with levels from Info to Fatal to the console
+        config.AddRule(NLog.LogLevel.Warn, NLog.LogLevel.Fatal, logConsole);
+        // send logs with levels from Debug to Fatal to the console
+        config.AddRule(NLog.LogLevel.Debug, NLog.LogLevel.Fatal, debugConsole);
+
+        // apply the configuration
+        LogManager.Configuration = config;
+
+        // create a logger
+        logger = LogManager.GetCurrentClassLogger();
+        
         return await rootCommand.InvokeAsync(args);
     }
 
-    private static void ReadFile(FileInfo file, bool extractOption)
+    private static void ReadFile(FileInfo file, bool extractOption, bool jsonOption, bool debugOption)
     {
         Stopwatch sw = new Stopwatch();
         sw.Start();
+        
+        logger.Info("VortexPak Started");
+        logger.Debug($"fileArgument={file.FullName}");
+        logger.Debug($"extractOption={extractOption}");
+        logger.Debug($"jsonOption={jsonOption}");
+        logger.Debug($"debugOption={debugOption}");
         
         try
         {
@@ -290,7 +333,7 @@ class Program
             
             var version = FindFileVersion(br);
 
-            Console.WriteLine($"File version is {version}");
+            logger.Info($"File version is {version}");
 
             if (version == 0 || version > MAX_SUPPORTED_VERSION)
             {
@@ -300,93 +343,126 @@ class Program
             var pakFile = ReadPak(br, version);
             pakFile.filename = Path.GetFileName(file.FullName);
                 
-            Console.WriteLine($"Indexing complete in {sw.Elapsed:hh\\:mm\\:ss}");
+            logger.Info($"Indexing complete in {sw.Elapsed:hh\\:mm\\:ss}");
 
             var outputFolder = Path.Join("C:\\", Path.GetFileNameWithoutExtension(file.FullName));
-
-            var json = JsonConvert.SerializeObject(pakFile, Formatting.Indented);
             
-            var jsonOutput = Path.ChangeExtension(file.FullName, ".json");
-
-            //Console.WriteLine(json);
-
-            // extract files and write meta json?
-            
-            Console.WriteLine($"Writing JSON to {jsonOutput}");
-
-            System.IO.File.WriteAllText(jsonOutput, json);
-            
+            if (jsonOption)
+            {
+                Stopwatch jsonSw = new Stopwatch();
+                jsonSw.Start();
+                var json = JsonConvert.SerializeObject(pakFile, Formatting.Indented);
+                var jsonOutput = Path.ChangeExtension(file.FullName, ".json");
+                System.IO.File.WriteAllText(jsonOutput, json);
+                jsonSw.Stop();
+                
+                logger.Info($"{jsonOutput} written in {jsonSw.Elapsed:hh\\:mm\\:ss\\.ffff} seconds");
+            }
 
             if (extractOption)
             {
-                Console.WriteLine("Extract the files");
+                logger.Info("Extract the files");
                 
-                Console.WriteLine($"Extraction output folder is {outputFolder}");
+                logger.Info($"Extraction output folder is {outputFolder}");
                 
                 if(pakFile.index.hasFullDirectoryIndex)
                 {
-                    Console.WriteLine("This file contains a full directory index");
+                    logger.Info("This file contains a full directory index");
 
                     ExtractFromFullDirectory(br, pakFile.index, pakFile.fullDirectoryIndex, outputFolder);
                 }
                 else
                 {
-                    Console.WriteLine("This file contains the legacy index record");
+                    logger.Info("This file contains the legacy index record");
 
                     ExtractFromIndex(br, pakFile.index, outputFolder);
                 }
                 
-                Console.WriteLine("Extraction complete");
-                
                 sw.Stop();
-                Console.WriteLine($"Extraction completed in {sw.Elapsed:hh\\:mm\\:ss}");
-                
-                
-                // modern records
+                logger.Info($"Extraction completed in {sw.Elapsed:hh\\:mm\\:ss}");
             }
             else
             {
-                Console.WriteLine("Don't extract the files");
+                sw.Stop();
+                logger.Info($"Completed in {sw.Elapsed:hh\\:mm\\:ss}");
             }
-
             
-                
+            var summary = new Summary
+            {
+                encrypted = pakFile.footer.encrypedIndex,
+                fileVersion = version,
+                fileCount = pakFile.index.hasFullDirectoryIndex ? pakFile.index.entryCount : pakFile.index.recordCount,
+                mountPoint = pakFile.index.mountPoint,
+                path = file.FullName,
+                extracted = extractOption
+            };
+            
+            Console.WriteLine(JsonConvert.SerializeObject(summary, Formatting.None));
+            
         }
         catch (FileNotFoundException fnfe)
         {
             // Exception handler for FileNotFoundException
             // We just inform the user that there is no such file
-            Console.WriteLine("The file '{0}' is not found.", file);
+            logger.Error("The file '{0}' is not found.", file);
         }
         catch (PakException pex)
         {
             // Exception handler for PakException
             // We just inform the user with the message
-            Console.WriteLine(pex.Message);
+            logger.Error(pex.Message);
         }
         catch (IOException ioe)
         {
             // Exception handler for other input/output exceptions
-            Console.WriteLine(ioe.StackTrace);
+            logger.Error(ioe.StackTrace);
         }
         catch (Exception ex)
         {
             // Exception handler for any other exception that may occur and was not already handled specifically
-            Console.WriteLine(ex.ToString());
+            logger.Error(ex.ToString());
         }
 
+    }
+    
+    public static string NormalizePath(string filePath)
+    {
+        string trimmed = filePath.Replace("/", Path.DirectorySeparatorChar.ToString());
+        string[] segments = trimmed.Split(Path.DirectorySeparatorChar);
+        List<string> normal = new List<string>();
+
+        foreach (string segment in segments)
+        {
+            if (segment != "." && segment != "..")
+            {
+                normal.Add(segment);
+            }
+        }
+
+        return string.Join(Path.DirectorySeparatorChar, normal);
     }
 
     private static void ExtractFromIndex(BinaryReader br, Index index, string outputFolder)
     {
         foreach (var record in index.indexRecords)
         {
-            string outfile = Path.GetFullPath(Path.Combine(outputFolder , $"{index.mountPoint}{record.filename}"));
-            Console.WriteLine($"Outfile: {outfile}");
+            //string outfile = Path.GetFullPath(Path.Combine(outputFolder , $"{index.mountPoint}{record.filename}"));
+            string normalizedPath = NormalizePath($"{index.mountPoint}{record.filename}");
+            string outfile = Path.GetFullPath(Path.Combine(outputFolder, normalizedPath));
+            //Console.WriteLine($"Outfile: {outfile}");
+            
+            Stopwatch sw = new Stopwatch();
+            sw.Start();
                 
+            //byte[] bytes = GetBytesFromPak(br, file.dataRecord, $"{index.mountPoint}{dir.directoryName}{file.filename}", true);
+            //GetBytesFromPak(br, file.dataRecord, $"{index.mountPoint}{dir.directoryName}{file.filename}", outfile, true);
+                    
+               
             //byte[] bytes = GetBytesFromPak(br, record.dataRecord, $"{index.mountPoint}{record.filename}");
             GetBytesFromPak(br, record.dataRecord, $"{index.mountPoint}{record.filename}", outfile);
-                    
+            
+            logger.Debug($"{outfile} ({record.fileMetadata.uncompressedSize:n0} bytes) written in {sw.Elapsed:ss\\.ffff} seconds");
+            
             //(new FileInfo(outfile)).Directory.Create();
             //System.IO.File.WriteAllBytes(outfile, bytes);
             
@@ -407,7 +483,7 @@ class Program
                 //byte[] bytes = GetBytesFromPak(br, file.dataRecord, $"{index.mountPoint}{dir.directoryName}{file.filename}", true);
                 GetBytesFromPak(br, file.dataRecord, $"{index.mountPoint}{dir.directoryName}{file.filename}", outfile, true);
                     
-                Console.WriteLine($"{outfile} ({file.dataRecord.fileMetadata.uncompressedSize:n0} bytes) written in {sw.Elapsed:ss\\.ffff} seconds");
+                logger.Debug($"{outfile} ({file.dataRecord.fileMetadata.uncompressedSize:n0} bytes) written in {sw.Elapsed:ss\\.ffff} seconds");
                 //(new FileInfo(outfile)).Directory.Create();
                 //System.IO.File.WriteAllBytes(outfile, bytes);
             }
@@ -555,7 +631,7 @@ class Program
 
         if (index.hasFullDirectoryIndex)
         {
-            Console.WriteLine("This file contains a full directory index");
+            logger.Debug("This file contains a full directory index");
             
             // version 10 or above is confirmed and we need to go get the newer
             // folder/file data
@@ -572,8 +648,10 @@ class Program
                 for (var j = 0; j < dir.files.Length; j++)
                 {
                     var file = dir.files[j];
-
-                    Console.WriteLine($"File: {dir.directoryName}{file.filename}");
+                    
+                    var path = NormalizePath($"{index.mountPoint}{dir.directoryName}{file.filename}");
+                    logger.Debug($"File: {path}");
+                    //logger.Debug($"File: {dir.directoryName}{file.filename}");
 
                     reader.BaseStream.Seek(file.encodedEntryInfoOffset, SeekOrigin.Begin);
 
@@ -643,7 +721,13 @@ class Program
         }
         else
         {
-            Console.WriteLine("This file contains the legacy index record");
+            logger.Debug("This file contains the legacy index record");
+
+            foreach (var record in index.indexRecords)
+            {
+                var path = NormalizePath($"{index.mountPoint}{record.filename}");
+                logger.Debug($"File: {path}");
+            }
         }
                 
         var pakFile = new PakFile
@@ -725,7 +809,7 @@ class Program
     {
         var footerSize = GetFooterSize(version);
 
-        Console.WriteLine($"Footer size is {footerSize}");
+        logger.Debug($"Footer size is {footerSize}");
         
         /*
          * v1-v3 = 44 !
@@ -811,7 +895,7 @@ class Program
 
         index.encodedEntryInfoSize = br.ReadInt32();
         index.encodedEntryInfo = br.ReadBytes(index.encodedEntryInfoSize);
-        index.recordCount = br.ReadUInt32(); // poss unused with ver 10
+        index.recordCount = (int) br.ReadUInt32(); // poss unused with ver 10
 
         return index;
     }
@@ -827,7 +911,7 @@ class Program
         index.mountPointSize = br.ReadInt32();
         index.mountPoint = ReadNullTerminatedString(br);
         
-        index.recordCount = br.ReadUInt32();
+        index.recordCount = (int) br.ReadUInt32();
         
         index.indexRecords = new IndexRecord[index.recordCount];
 
@@ -933,7 +1017,7 @@ class Program
         br.BaseStream.Seek(position, SeekOrigin.Begin);
 
         fullDirectoryIndex.directoryCount = br.ReadUInt32();
-        Console.WriteLine($"DirectoryCount {fullDirectoryIndex.directoryCount}");
+        logger.Debug($"DirectoryCount {fullDirectoryIndex.directoryCount}");
 
         fullDirectoryIndex.directories = new Directory[fullDirectoryIndex.directoryCount];
 

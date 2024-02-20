@@ -9,7 +9,11 @@
     </PropertyGroup>
 
     <ItemGroup>
+      <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.0" />
+      <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
+      <PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="8.0.0" />
       <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+      <PackageReference Include="NLog" Version="5.2.8" />
       <PackageReference Include="Oodle.NET" Version="1.0.1" />
       <PackageReference Include="SharpZipLib" Version="1.4.2" />
       <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
