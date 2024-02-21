@@ -12,6 +12,7 @@ using System.Security.Cryptography;
 using ICSharpCode.SharpZipLib.Zip.Compression;
 using ICSharpCode.SharpZipLib.Zip.Compression.Streams;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Converters;
 using NLog;
 using Oodle.NET;
 
@@ -151,6 +152,7 @@ struct IndexRecord
     public string filename;
     public Record fileMetadata;
     public DataRecord dataRecord;
+    public string fullpath;
 }
 
 struct DataRecord
@@ -223,6 +225,7 @@ struct File
     public uint encodedEntryInfoOffset;
     public EncodedRecord encodedRecord;
     public DataRecord dataRecord;
+    public string fullpath;
 }
 
 struct EncodedRecord
@@ -247,16 +250,35 @@ struct PakFile
     public Footer footer;
     public Index index;
     public FullDirectoryIndex fullDirectoryIndex;
+    public string[] normalizedFilePaths;
+}
+
+[JsonConverter(typeof(StringEnumConverter))]
+enum ModType
+{
+    None,
+    Regular,
+    Blueprint
 }
 
 struct Summary
 {
-    public string path;
+    public string filePath;
     public bool encrypted;
-    public int fileVersion;
+    public int pakVersion;
     public int fileCount;
     public string mountPoint;
-    public bool extracted;
+    public string normalizedMountPoint;
+    public TimeSpan timeTaken;
+    public ModType modType;
+    public string blueprintModName;
+}
+
+
+struct ModMetaData
+{
+    public string blueprintModName;
+    public ModType modType;
 }
 
 class Program
@@ -280,6 +302,7 @@ class Program
         var extractOption = new Option<Boolean>(new[] { "--extract", "-e" }, () => false, "Extract PAK file contents");
         var jsonOption = new Option<Boolean>(new[] { "--json", "-j" }, () => false, "Write JSON metadata file");
         var debugOption = new Option<Boolean>(new[] { "--debug", "-d" }, () => false, "Debug output");
+        var modOption = new Option<Boolean>(new[] { "--mod", "-m" }, () => false, "Extra analysis if a mod PAK file");
         var fileArgument = new Argument<FileInfo>(name: "file", description: "PAK file to parse");
         
         var rootCommand = new RootCommand("Sample command-line app")
@@ -287,10 +310,11 @@ class Program
             fileArgument,
             extractOption,
             jsonOption,
-            debugOption
+            debugOption,
+            modOption
         };
 
-        rootCommand.SetHandler(ReadFile, fileArgument, extractOption, jsonOption, debugOption);
+        rootCommand.SetHandler(ReadFile, fileArgument, extractOption, jsonOption, debugOption, modOption);
 
         // logging stuff
         
@@ -316,7 +340,7 @@ class Program
         return await rootCommand.InvokeAsync(args);
     }
 
-    private static void ReadFile(FileInfo file, bool extractOption, bool jsonOption, bool debugOption)
+    private static void ReadFile(FileInfo file, bool extractOption, bool jsonOption, bool debugOption, bool modOption)
     {
         Stopwatch sw = new Stopwatch();
         sw.Start();
@@ -326,6 +350,7 @@ class Program
         logger.Debug($"extractOption={extractOption}");
         logger.Debug($"jsonOption={jsonOption}");
         logger.Debug($"debugOption={debugOption}");
+        logger.Debug($"modOption={modOption}");
         
         try
         {
@@ -333,22 +358,44 @@ class Program
             
             var version = FindFileVersion(br);
 
-            logger.Info($"File version is {version}");
-
             if (version == 0 || version > MAX_SUPPORTED_VERSION)
             {
-                throw new PakException($"Version not supported. Not a valid PAK file");
+                throw new PakException($"Not a valid PAK file. Version not supported.");
             }
+            
+            logger.Info($"File version is {version}");
 
             var pakFile = ReadPak(br, version);
             pakFile.filename = Path.GetFileName(file.FullName);
                 
-            logger.Info($"Indexing complete in {sw.Elapsed:hh\\:mm\\:ss}");
+            logger.Info($"Indexing complete in {sw.Elapsed:hh\\:mm\\:ss\\.ffff}");
 
             var outputFolder = Path.Join("C:\\", Path.GetFileNameWithoutExtension(file.FullName));
             
+            var summary = new Summary
+            {
+                encrypted = pakFile.footer.encrypedIndex,
+                pakVersion = version,
+                fileCount = pakFile.index.hasFullDirectoryIndex ? pakFile.index.entryCount : pakFile.index.recordCount,
+                mountPoint = pakFile.index.mountPoint,
+                normalizedMountPoint = NormalizePath(pakFile.index.mountPoint),
+                filePath = file.FullName,
+                timeTaken = sw.Elapsed
+            };
+            
+            if (modOption)
+            {
+                logger.Debug("Mod analysis option. Analyzing mod type.");
+                var modMeta = AnalyzeMod(pakFile);
+
+                summary.modType = modMeta.modType;
+                summary.blueprintModName = modMeta.blueprintModName;
+            }
+            
             if (jsonOption)
             {
+                logger.Debug("Json output option. Writing metadata file.");
+                
                 Stopwatch jsonSw = new Stopwatch();
                 jsonSw.Start();
                 var json = JsonConvert.SerializeObject(pakFile, Formatting.Indented);
@@ -361,43 +408,33 @@ class Program
 
             if (extractOption)
             {
-                logger.Info("Extract the files");
-                
-                logger.Info($"Extraction output folder is {outputFolder}");
+                logger.Info($"Extract option is enabled. Extracting files to {outputFolder}");
                 
                 if(pakFile.index.hasFullDirectoryIndex)
                 {
-                    logger.Info("This file contains a full directory index");
+                    logger.Debug("This file contains a full directory index");
 
                     ExtractFromFullDirectory(br, pakFile.index, pakFile.fullDirectoryIndex, outputFolder);
                 }
                 else
                 {
-                    logger.Info("This file contains the legacy index record");
+                    logger.Debug("This file contains the legacy index record");
 
                     ExtractFromIndex(br, pakFile.index, outputFolder);
                 }
                 
-                sw.Stop();
-                logger.Info($"Extraction completed in {sw.Elapsed:hh\\:mm\\:ss}");
+                logger.Info($"Extraction completed in {sw.Elapsed:hh\\:mm\\:ss\\.ffff}");
             }
             else
             {
-                sw.Stop();
-                logger.Info($"Completed in {sw.Elapsed:hh\\:mm\\:ss}");
+                logger.Info($"Completed in {sw.Elapsed:hh\\:mm\\:ss\\.ffff}");
             }
             
-            var summary = new Summary
-            {
-                encrypted = pakFile.footer.encrypedIndex,
-                fileVersion = version,
-                fileCount = pakFile.index.hasFullDirectoryIndex ? pakFile.index.entryCount : pakFile.index.recordCount,
-                mountPoint = pakFile.index.mountPoint,
-                path = file.FullName,
-                extracted = extractOption
-            };
             
-            Console.WriteLine(JsonConvert.SerializeObject(summary, Formatting.None));
+            Console.WriteLine(JsonConvert.SerializeObject(summary, Formatting.None, new JsonSerializerSettings
+            {
+                NullValueHandling = NullValueHandling.Ignore
+            }));
             
         }
         catch (FileNotFoundException fnfe)
@@ -424,8 +461,29 @@ class Program
         }
 
     }
-    
-    public static string NormalizePath(string filePath)
+
+    private static ModMetaData AnalyzeMod(PakFile pakFile, bool debug = false)
+    {
+        // do something with file paths
+        // look for a Mods folder in one of the paths, if it exists then we return blueprint type, if not, regular type
+        
+        foreach (var path in pakFile.normalizedFilePaths)
+        {
+            var directories = path.Split("\\");
+
+            var modsIndex = Array.IndexOf(directories, "Mods", 0);
+
+            if (modsIndex == -1) continue;
+            
+            logger.Debug($"Found Mods folder in {path}. This is a blueprint mod. Mod name is {directories[modsIndex + 1]}");
+
+            return new ModMetaData { modType = ModType.Blueprint, blueprintModName = directories[modsIndex + 1] };
+        }
+
+        return new ModMetaData { modType = ModType.Regular, blueprintModName = ""};
+    }
+
+    private static string NormalizePath(string filePath)
     {
         string trimmed = filePath.Replace("/", Path.DirectorySeparatorChar.ToString());
         string[] segments = trimmed.Split(Path.DirectorySeparatorChar);
@@ -433,7 +491,7 @@ class Program
 
         foreach (string segment in segments)
         {
-            if (segment != "." && segment != "..")
+            if ( segment != "" && segment != "." && segment != "..")
             {
                 normal.Add(segment);
             }
@@ -623,11 +681,13 @@ class Program
     
     
    
-    private static PakFile ReadPak(BinaryReader br, int version)
+    private static PakFile ReadPak(BinaryReader br, int version, bool debug = false)
     {
         var footer = ReadFooter(br, version);
         var index = ReadIndex(br, version, footer.indexOffset);
         var fullDirectoryIndex = new FullDirectoryIndex();
+        
+        var normalizedFilePaths = new List<string>();
 
         if (index.hasFullDirectoryIndex)
         {
@@ -640,6 +700,8 @@ class Program
             MemoryStream ms = new MemoryStream(index.encodedEntryInfo);
             BinaryReader reader = new BinaryReader(ms);
             
+            var flatFileList = new List<File>();
+            
             // loop through the index
             for (var i = 0; i < fullDirectoryIndex.directories.Length; i++)
             {
@@ -648,10 +710,8 @@ class Program
                 for (var j = 0; j < dir.files.Length; j++)
                 {
                     var file = dir.files[j];
-                    
-                    var path = NormalizePath($"{index.mountPoint}{dir.directoryName}{file.filename}");
-                    logger.Debug($"File: {path}");
-                    //logger.Debug($"File: {dir.directoryName}{file.filename}");
+
+                    file.fullpath = $"{index.mountPoint}{dir.directoryName}{file.filename}";
 
                     reader.BaseStream.Seek(file.encodedEntryInfoOffset, SeekOrigin.Begin);
 
@@ -693,19 +753,22 @@ class Program
                     }
 
                     /*
-                    if (encodedRecord.info.CompressionBlockCount > 0 || (encodedRecord.info.IsEncrypted || encodedRecord.info.CompressionBlockCount != 1))
+                    if (encodedRecord.info.CompressionBlockCount > 0 && (encodedRecord.info.IsEncrypted || encodedRecord.info.CompressionBlockCount != 1))
                     {
                         encodedRecord.blockSize = reader.ReadUInt32();
                     }*/
 
                     file.encodedRecord = encodedRecord;
 
-                    // get data reecord?
+                    // get data record?
 
                     file.dataRecord = GetDataRecord(br, version, (long)encodedRecord.offset);
                     
+                    flatFileList.Add(file);
+                    
                     dir.files[j] = file;
-
+                    
+                    
                     /*
                      * if compression block count > 0 && (encrypted || compression block count != 1)
                           for _ in 0..compression block count
@@ -718,15 +781,28 @@ class Program
 
             reader.Close();
             ms.Close();
+            
+            // clean output
+
+            foreach (var file in flatFileList)  
+            {
+                var path = NormalizePath(file.fullpath);
+                logger.Debug($"File: {path}");
+                normalizedFilePaths.Add(path);
+            }
+            
+            
         }
         else
         {
             logger.Debug("This file contains the legacy index record");
 
+            // clean output
             foreach (var record in index.indexRecords)
             {
-                var path = NormalizePath($"{index.mountPoint}{record.filename}");
+                var path = NormalizePath(record.fullpath);
                 logger.Debug($"File: {path}");
+                normalizedFilePaths.Add(path);
             }
         }
                 
@@ -735,6 +811,7 @@ class Program
             index = index,
             fullDirectoryIndex = fullDirectoryIndex,
             footer = footer,
+            normalizedFilePaths = normalizedFilePaths.ToArray()
         };
 
         return pakFile;
@@ -746,7 +823,7 @@ class Program
     /// <typeparam name="T">The type of the struct that is to be created.</typeparam>
     /// <param name="value">The initial value of the struct.</param>
     /// <returns>The instance of the new struct.</returns>
-    public static T CreateBitField<T>(ulong value) where T : struct
+    private static T CreateBitField<T>(ulong value) where T : struct
     {
         // The created struct has to be boxed, otherwise PropertyInfo.SetValue
         // will work on a copy instead of the actual object
@@ -772,7 +849,7 @@ class Program
     {
         if(br.BaseStream.Length < FOOTER_SEARCH_SIZE)
         {
-            throw new PakException($"File is too small. Not a valid PAK file");
+            throw new PakException($"Not a valid PAK file. File is too small.");
         }
         
         // start with the max offset for footer
@@ -802,7 +879,7 @@ class Program
             br.BaseStream.Seek(pos, 0);
         }
         
-        throw new PakException($"Magic byte not found. Not a valid PAK file");
+        throw new PakException($"Not a valid PAK file. Magic byte not found.");
     }
 
     private static Footer ReadFooter(BinaryReader br, int version)
@@ -923,6 +1000,9 @@ class Program
                 filename = ReadNullTerminatedString(br),
                 fileMetadata = GetRecord(br, version, br.BaseStream.Position),
             };
+            
+            // fullpath
+            indexRecord.fullpath = $"{index.mountPoint}{indexRecord.filename}";
 
             //DataRecord
             indexRecord.dataRecord = GetDataRecord(br, version, (long)indexRecord.fileMetadata.offset);
@@ -1101,4 +1181,5 @@ class Program
         return str;
     }
 }
+
 
